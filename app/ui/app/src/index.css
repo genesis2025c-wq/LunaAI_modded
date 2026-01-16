@@ -1,0 +1,30 @@
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+@import "katex/dist/katex.min.css";
+
+:root {
+  --accent-color: #3b82f6;
+  --primary-color: #252535;
+}
+
+@theme {
+  --font-sans: ui-sans-serif, system-ui, "Segoe UI", sans-serif;
+  --font-rounded:
+    "SF Pro Rounded", ui-sans-serif, system-ui, "Segoe UI", sans-serif;
+  --color-primary: var(--accent-color);
+  --color-app-bg: var(--primary-color);
+}
+
+/* messaging-style typing indicator animation */
+@keyframes typing {
+
+  0%,
+  60%,
+  100% {
+    opacity: 0;
+  }
+
+  30% {
+    opacity: 1;
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "extends": "./tsconfig.app.json",
+  "compilerOptions": {
+    "types": [
+      "@storybook/react-vite",
+      "vite/client"
+    ]
+  },
+  "include": [
+    "src/**/*.stories.*"
+  ],
+  "exclude": []
+}
