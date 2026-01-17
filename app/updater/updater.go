@@ -1,191 +1,217 @@
-//go:build windows || darwin
-
 package updater
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
-	"mime"
 	"net/http"
 	"os"
-	"path/filepath"
+	"os/exec"
+	"runtime"
 	"strings"
-	"time"
 
-	"github.com/ollama/ollama/app/store"
+	"github.com/ollama/ollama/app/version"
 )
+
+type Updater struct {
+	Owner string
+	Repo  string
+}
 
 var (
-	UpdateCheckURLBase      = "https://ollama.com/api/update"
-	UpdateDownloaded        = false
-	UpdateCheckInterval     = 60 * 60 * time.Second
-	UpdateCheckInitialDelay = 3 * time.Second // 30 * time.Second
+	Owner = "genesis2025c-wq"
+	Repo  = "LunaAI_modded"
 
-	UpdateStageDir    string
-	UpgradeLogFile    string
-	UpgradeMarkerFile string
-	Installer         string
-	UserAgentOS       string
-
-	VerifyDownload func() error
+	DefaultUpdater = NewUpdater(Owner, Repo)
 )
 
-// TODO - maybe move up to the API package?
-type UpdateResponse struct {
-	UpdateURL     string `json:"url"`
-	UpdateVersion string `json:"version"`
+func NewUpdater(owner, repo string) *Updater {
+	return &Updater{
+		Owner: owner,
+		Repo:  repo,
+	}
 }
 
-func (u *Updater) checkForUpdate(ctx context.Context) (bool, UpdateResponse) {
-	// Update checks disabled for Luna AI.
-	return false, UpdateResponse{}
+func (u *Updater) Check(ctx context.Context) (*UpdateStatus, error) {
+	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/releases/latest", u.Owner, u.Repo)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("github api returned status %d", resp.StatusCode)
+	}
+
+	var release Release
+	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+		return nil, err
+	}
+
+	current := version.Version
+	latest := strings.TrimPrefix(release.TagName, "v")
+
+	if isNewer(current, latest) {
+		// Find matching asset for platform
+		assetURL := ""
+		for _, a := range release.Assets {
+			if strings.Contains(strings.ToLower(a.Name), runtime.GOOS) && strings.Contains(strings.ToLower(a.Name), runtime.GOARCH) {
+				assetURL = a.BrowserDownloadURL
+				break
+			}
+		}
+
+		return &UpdateStatus{
+			NewVersion: true,
+			Version:    release.TagName,
+			Changelog:  release.Body,
+			AssetURL:   assetURL,
+			Release:    release,
+		}, nil
+	}
+
+	return &UpdateStatus{NewVersion: false}, nil
 }
 
-func (u *Updater) DownloadNewRelease(ctx context.Context, updateResp UpdateResponse) error {
-	// Do a head first to check etag info
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, updateResp.UpdateURL, nil)
+func (u *Updater) Download(ctx context.Context, url string, targetPath string) error {
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return err
 	}
 
-	// In case of slow downloads, continue the update check in the background
-	bgctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	go func() {
-		for {
-			select {
-			case <-bgctx.Done():
-				return
-			case <-time.After(UpdateCheckInterval):
-				u.checkForUpdate(bgctx)
-			}
-		}
-	}()
-
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("error checking update: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status attempting to download update %d", resp.StatusCode)
-	}
-	resp.Body.Close()
-	etag := strings.Trim(resp.Header.Get("etag"), "\"")
-	if etag == "" {
-		slog.Debug("no etag detected, falling back to filename based dedup")
-		etag = "_"
-	}
-	filename := Installer
-	_, params, err := mime.ParseMediaType(resp.Header.Get("content-disposition"))
-	if err == nil {
-		filename = params["filename"]
-	}
-
-	stageFilename := filepath.Join(UpdateStageDir, etag, filename)
-
-	// Check to see if we already have it downloaded
-	_, err = os.Stat(stageFilename)
-	if err == nil {
-		slog.Info("update already downloaded", "bundle", stageFilename)
-		return nil
-	}
-
-	cleanupOldDownloads(UpdateStageDir)
-
-	req.Method = http.MethodGet
-	resp, err = http.DefaultClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("error checking update: %w", err)
+		return err
 	}
 	defer resp.Body.Close()
-	etag = strings.Trim(resp.Header.Get("etag"), "\"")
-	if etag == "" {
-		slog.Debug("no etag detected, falling back to filename based dedup") // TODO probably can get rid of this redundant log
-		etag = "_"
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("download failed with status %d", resp.StatusCode)
 	}
 
-	stageFilename = filepath.Join(UpdateStageDir, etag, filename)
-
-	_, err = os.Stat(filepath.Dir(stageFilename))
-	if errors.Is(err, os.ErrNotExist) {
-		if err := os.MkdirAll(filepath.Dir(stageFilename), 0o755); err != nil {
-			return fmt.Errorf("create ollama dir %s: %v", filepath.Dir(stageFilename), err)
-		}
-	}
-
-	payload, err := io.ReadAll(resp.Body)
+	out, err := os.Create(targetPath)
 	if err != nil {
-		return fmt.Errorf("failed to read body response: %w", err)
+		return err
 	}
-	fp, err := os.OpenFile(stageFilename, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o755)
-	if err != nil {
-		return fmt.Errorf("write payload %s: %w", stageFilename, err)
-	}
-	defer fp.Close()
-	if n, err := fp.Write(payload); err != nil || n != len(payload) {
-		return fmt.Errorf("write payload %s: %d vs %d -- %w", stageFilename, n, len(payload), err)
-	}
-	slog.Info("new update downloaded " + stageFilename)
+	defer out.Close()
 
-	if err := VerifyDownload(); err != nil {
-		_ = os.Remove(stageFilename)
-		return fmt.Errorf("%s - %s", resp.Request.URL.String(), err)
+	_, err = io.Copy(out, resp.Body)
+	return err
+}
+
+func (u *Updater) Apply(newBinaryPath string) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
 	}
-	UpdateDownloaded = true
+
+	oldExe := exe + ".old"
+
+	// Remove previous .old if exists
+	os.Remove(oldExe)
+
+	// Step 1: Rename current to .old
+	if err := os.Rename(exe, oldExe); err != nil {
+		return fmt.Errorf("failed to rename current binary: %w", err)
+	}
+
+	// Step 2: Move new binary to current location
+	if err := os.Rename(newBinaryPath, exe); err != nil {
+		// Rollback if failed
+		os.Rename(oldExe, exe)
+		return fmt.Errorf("failed to move new binary: %w", err)
+	}
+
+	// Step 3: Restart
+	cmd := exec.Command(exe, os.Args[1:]...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		// Rollback
+		os.Rename(oldExe, exe)
+		return fmt.Errorf("failed to restart: %w", err)
+	}
+
+	os.Exit(0)
 	return nil
 }
 
-func cleanupOldDownloads(stageDir string) {
-	files, err := os.ReadDir(stageDir)
-	if err != nil && errors.Is(err, os.ErrNotExist) {
-		// Expected behavior on first run
-		return
-	} else if err != nil {
-		slog.Warn(fmt.Sprintf("failed to list stage dir: %s", err))
-		return
-	}
-	for _, file := range files {
-		fullname := filepath.Join(stageDir, file.Name())
-		slog.Debug("cleaning up old download: " + fullname)
-		err = os.RemoveAll(fullname)
-		if err != nil {
-			slog.Warn(fmt.Sprintf("failed to cleanup stale update download %s", err))
-		}
-	}
+// Package-level functions for compatibility
+func DoUpgrade(interactive bool) error {
+	// In the new system, we expect the asset to be already known or chosen
+	// For background compatibility, we might need a stored asset URL
+	// For now, this is a placeholder or we can trigger a check+download+apply
+	return errors.New("DoUpgrade called without specific asset. Use API flow.")
 }
 
-type Updater struct {
-	Store *store.Store
+func IsUpdatePending() bool {
+	return false // Simplified for new system
 }
 
-func (u *Updater) StartBackgroundUpdaterChecker(ctx context.Context, cb func(string) error) {
-	go func() {
-		// Don't blast an update message immediately after startup
-		time.Sleep(UpdateCheckInitialDelay)
-		slog.Info("beginning update checker", "interval", UpdateCheckInterval)
-		for {
-			available, resp := u.checkForUpdate(ctx)
-			if available {
-				err := u.DownloadNewRelease(ctx, resp)
-				if err != nil {
-					slog.Error(fmt.Sprintf("failed to download new release: %s", err))
-				} else {
-					err = cb(resp.UpdateVersion)
-					if err != nil {
-						slog.Warn(fmt.Sprintf("failed to register update available with tray: %s", err))
-					}
-				}
-			}
-			select {
-			case <-ctx.Done():
-				slog.Debug("stopping background update checker")
-				return
-			default:
-				time.Sleep(UpdateCheckInterval)
-			}
+func DoUpgradeAtStartup() error {
+	return nil
+}
+
+func DoPostUpgradeCleanup() error {
+	exe, err := os.Executable()
+	if err == nil {
+		os.Remove(exe + ".old")
+	}
+	return nil
+}
+
+// Simple semver comparison
+func isNewer(current, latest string) bool {
+	if latest == "" {
+		return false
+	}
+	if current == "0.0.0" || current == "" {
+		return true
+	}
+
+	cParts := strings.Split(strings.TrimPrefix(current, "v"), ".")
+	lParts := strings.Split(strings.TrimPrefix(latest, "v"), ".")
+
+	for i := 0; i < len(cParts) && i < len(lParts); i++ {
+		var cv, lv int
+		fmt.Sscanf(cParts[i], "%d", &cv)
+		fmt.Sscanf(lParts[i], "%d", &lv)
+		if lv > cv {
+			return true
 		}
-	}()
+		if cv > lv {
+			return false
+		}
+	}
+	return len(lParts) > len(cParts)
+}
+
+func VerifyChecksum(filePath, expectedHash string) error {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return err
+	}
+
+	actualHash := hex.EncodeToString(h.Sum(nil))
+	if !strings.EqualFold(actualHash, expectedHash) {
+		return fmt.Errorf("checksum mismatch: expected %s, got %s", expectedHash, actualHash)
+	}
+	return nil
 }

@@ -30,6 +30,7 @@ import (
 	"github.com/ollama/ollama/app/tools"
 	"github.com/ollama/ollama/app/types/not"
 	"github.com/ollama/ollama/app/ui/responses"
+	"github.com/ollama/ollama/app/updater"
 	"github.com/ollama/ollama/app/version"
 	ollamaAuth "github.com/ollama/ollama/auth"
 	"github.com/ollama/ollama/envconfig"
@@ -107,7 +108,8 @@ type Server struct {
 	WorkingDir   string // Working directory for all agent operations
 
 	// Dev is true if the server is running in development mode
-	Dev bool
+	Dev     bool
+	Updater *updater.Updater
 }
 
 func (s *Server) log() *slog.Logger {
@@ -304,6 +306,9 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /", s.appHandler())
 	mux.Handle("PATCH /", s.appHandler())
 	mux.Handle("DELETE /", s.appHandler())
+
+	mux.HandleFunc("/api/update/check", s.handleUpdateCheck)
+	mux.HandleFunc("/api/update/apply", s.handleUpdateApply)
 
 	return mux
 }
@@ -516,13 +521,74 @@ func (s *Server) getError(err error) responses.ErrorEvent {
 }
 
 func (s *Server) browserState(chat *store.Chat) (*responses.BrowserStateData, bool) {
-	if len(chat.BrowserState) > 0 {
-		var st responses.BrowserStateData
-		if err := json.Unmarshal(chat.BrowserState, &st); err == nil {
-			return &st, true
-		}
-	}
 	return nil, false
+}
+
+func (s *Server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
+	if s.Updater == nil {
+		http.Error(w, "updater not initialized", http.StatusInternalServerError)
+		return
+	}
+
+	status, err := s.Updater.Check(r.Context())
+	if err != nil {
+		s.log().Error("failed to check for updates", "error", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(status)
+}
+
+func (s *Server) handleUpdateApply(w http.ResponseWriter, r *http.Request) {
+	if s.Updater == nil {
+		http.Error(w, "updater not initialized", http.StatusInternalServerError)
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		AssetURL string `json:"asset_url"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.AssetURL == "" {
+		http.Error(w, "asset_url is required", http.StatusBadRequest)
+		return
+	}
+
+	// 1. Download to temp file
+	tempDir, err := os.MkdirTemp("", "luna-update")
+	if err != nil {
+		http.Error(w, "failed to create temp dir", http.StatusInternalServerError)
+		return
+	}
+	tempExePath := filepath.Join(tempDir, "update.exe")
+
+	s.log().Info("downloading update", "url", req.AssetURL)
+	if err := s.Updater.Download(r.Context(), req.AssetURL, tempExePath); err != nil {
+		s.log().Error("download failed", "error", err)
+		http.Error(w, "download failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// 2. Apply (this will exit the process if successful)
+	s.log().Info("applying update", "path", tempExePath)
+	if err := s.Updater.Apply(tempExePath); err != nil {
+		s.log().Error("apply failed", "error", err)
+		http.Error(w, "apply failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
 }
 
 // reconstructBrowserState (legacy): return the latest full browser state stored in messages.
