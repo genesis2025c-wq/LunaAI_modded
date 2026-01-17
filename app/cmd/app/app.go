@@ -5,11 +5,15 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/google/uuid"
@@ -19,6 +23,7 @@ import (
 	"github.com/ollama/ollama/app/tools"
 	"github.com/ollama/ollama/app/ui"
 	"github.com/ollama/ollama/app/updater"
+	"github.com/ollama/ollama/app/version"
 )
 
 var (
@@ -31,6 +36,18 @@ var debug = strings.EqualFold(os.Getenv("OLLAMA_DEBUG"), "true") || os.Getenv("O
 var (
 	fastStartup = false
 	devMode     = false
+)
+
+type appMove int
+
+const (
+	CannotMove appMove = iota
+	UserDeclinedMove
+	MoveCompleted
+	AlreadyMoved
+	LoginSession
+	PermissionDenied
+	MoveError
 )
 
 func main() {
@@ -67,6 +84,8 @@ func main() {
 	if err == nil {
 		slog.SetDefault(slog.New(slog.NewTextHandler(logFile, &slog.HandlerOptions{Level: level})))
 	}
+
+	logStartup()
 
 	// Enable the new auto-updater
 	updater.UpdateCheckURLBase = "" // Disable legacy
@@ -117,8 +136,69 @@ func main() {
 	srv := &http.Server{Handler: uiServer.Handler()}
 	go srv.Serve(ln)
 
+	if urlSchemeRequest != "" {
+		go handleURLSchemeInCurrentInstance(urlSchemeRequest)
+	}
+
 	osRun(cancel, true, startHidden)
 	srv.Close()
 	cancel()
 	<-done
+}
+
+func startHiddenTasks() {
+	if updater.IsUpdatePending() {
+		if !fastStartup {
+			if err := updater.DoUpgradeAtStartup(); err == nil {
+				os.Exit(0)
+			}
+		}
+	}
+}
+
+func parseURLScheme(urlSchemeRequest string) (isConnect bool, err error) {
+	parsedURL, err := url.Parse(urlSchemeRequest)
+	if err != nil {
+		return false, fmt.Errorf("invalid URL: %w", err)
+	}
+	if parsedURL.Host == "connect" || strings.TrimPrefix(parsedURL.Path, "/") == "connect" {
+		return true, nil
+	}
+	return false, nil
+}
+
+func handleURLSchemeInCurrentInstance(urlSchemeRequest string) {
+	isConnect, err := parseURLScheme(urlSchemeRequest)
+	if err != nil {
+		return
+	}
+	if isConnect {
+		handleConnectURLScheme()
+	} else {
+		if wv.IsRunning() {
+			// Show window logic is platform specific and handled in wv.Run usually
+		}
+	}
+}
+
+func handleConnectURLScheme() {
+	openInBrowser("https://luna-ai.com/connect")
+}
+
+func openInBrowser(url string) {
+	var cmd string
+	var args []string
+	switch runtime.GOOS {
+	case "windows":
+		cmd = "rundll32"
+		args = []string{"url.dll,FileProtocolHandler", url}
+	case "darwin":
+		cmd = "open"
+		args = []string{url}
+	}
+	exec.Command(cmd, args...).Start()
+}
+
+func logStartup() {
+	slog.Info("starting Luna AI", "version", version.Version)
 }
