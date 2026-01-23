@@ -3,7 +3,7 @@ LunaAI is a modified version of Ollama that adds additional features on top of t
 
 <img width="1919" height="1032" alt="image" src="https://github.com/user-attachments/assets/581150c7-3c6f-4d5b-87a5-28082cba297c" />
 
-The original README was removed and is being rewritten.
+
 
 # How to Run
 Launch the application by double-clicking luna-ai.exe (Windows) or luna-ai from the root directory.
